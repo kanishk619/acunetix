@@ -10,21 +10,17 @@ class Acunetix(requests.Session):
     REPORT_TEMPLATES = {}
     SCANNING_PROFILES = {}
 
-    def __init__(self, username=None, password=None, domain=None, secure=True, *args, **kwargs):
+    def __init__(self, username=None, password=None, domain=None, ssl_verify=True, *args, **kwargs):
         if any([not username, not password, not domain]):
             raise ValueError("username, password and domain are required")
         requests.packages.urllib3.disable_warnings()
         super(Acunetix, self).__init__()
 
-        url = []
-        if secure:
-            url.append("https")
-        else:
-            url.append("http")
-        url.append("://")
-        url.append(domain)
+        url = ["https://", domain]
 
-        self.verify = False
+        self.verify = ssl_verify
+
+        self.timeout = 2
 
         self.headers = {
             "Accept": "application / json, text / plain, * / *",
@@ -35,10 +31,18 @@ class Acunetix(requests.Session):
         }
 
         self.authenticated = False
+        self.max_redirects = 0
         self.username = username
         self.password = hashlib.sha256(password.encode("utf-8")).hexdigest()
         self.url = "".join(url)
         self.check_connectivity()
+
+    def request(self, *args, **kwargs):
+        try:
+            return super(Acunetix, self).request(timeout=1, *args, **kwargs)
+        except Exception as e:
+            print("[!] Error : {}".format(e.__repr__()))
+            return False
 
     def login(self):
         """
@@ -71,12 +75,13 @@ class Acunetix(requests.Session):
         Checks server connectivity by making a call to http://server/build.json
         :return: build number of Acunetix app running on server
         """
-        url = self.url + "/build.json"
         try:
+            url = self.url + "/build.json"
             resp = self.get(url)
             self.build = resp.json()['build']
-        except requests.exceptions.ProxyError:
-            raise ConnectionError("Unable to connect to server")
+            return self.build
+        except Exception as e:
+            return False
 
     @property
     def stats(self):
@@ -309,27 +314,37 @@ class Acunetix(requests.Session):
         resp = self.delete(url)
         return resp.status_code
 
-    def scan_status(self, scan_id):
+    def scan_status(self, scan_id, extra_stats=False):
         """
         Makes 2 calls to server in order a create a stat dict
-        :param scan_id: str(scan_id
+        :param scan_id: str(scan_id)
+        :param extra_stats: boolean (True fetches all stats, False fetches basic)
         :return:  dict(stats)
         """
         url = self.url + "/api/v1/scans/{}".format(str(scan_id))
         resp = self.get(url).json()
+
+        if 'code' in resp and resp['code'] == 404:  # if scan doesn't exists on server
+            return None
+
         progress = resp['current_session']['progress']
         status = resp['current_session']['status']
-        vuln_stats = resp['current_session']['severity_counts']
-        vuln_stats["informational"] = vuln_stats.pop("info")
+        vuln_stats = None
+        if status != "scheduled":
+            vuln_stats = resp['current_session']['severity_counts']
+            vuln_stats["informational"] = vuln_stats.pop("info")
 
-        url = url + '/results/{}/statistics'.format(resp['current_session']['scan_session_id'])
-        resp = self.get(url).json()
-        aborted = resp['scanning_app']['wvs']['abort_requested']
-        start_date = resp['scanning_app']['wvs']['start_date']
-        end_data = resp['scanning_app']['wvs']['end_date']
+        data = {'progress': progress, 'status': status, 'vuln_stats': vuln_stats,
+                'session_id': resp['current_session']['scan_session_id']}
 
-        data = {'progress': progress, 'status': status, 'vuln_stats': vuln_stats, 'aborted': aborted,
-                'start_date': start_date, 'end_date': end_data}
+        if extra_stats:
+            url = url + '/results/{}/statistics'.format(resp['current_session']['scan_session_id'])
+            resp = self.get(url).json()
+            aborted = resp['scanning_app']['wvs']['abort_requested']
+            start_date = resp['scanning_app']['wvs']['start_date']
+            end_data = resp['scanning_app']['wvs']['end_date']
+            data.update({'aborted': aborted, 'start_date': start_date, 'end_date': end_data})
+
         return data
 
     def get_scan_vulnerabilities(self, scan_id):
@@ -356,6 +371,20 @@ class Acunetix(requests.Session):
             return self.get_scan_vulnerabilities(scan_id)
         else:
             return None
+
+    def get_vulnerability_by_id(self, scan_id, vulnerability_id, scan_session_id=None):
+        """
+        Get single vulnerability details
+        :param vulnerability_id: Vulnerability ID
+        :param scan_session_id: (optional)
+        :return: JSON response from server
+        """
+        if not scan_session_id:
+            scan_session_id = self.scan_status(scan_id)['session_id']
+        url = self.url + "/api/v1/scans/{}/results/{}/vulnerabilities/{}".format(scan_id, scan_session_id,
+                                                                                 vulnerability_id)
+        resp = self.get(url).json()
+        return resp
 
     @property
     def report_templates(self):
